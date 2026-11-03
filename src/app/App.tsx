@@ -7,7 +7,7 @@ type Meta = { id: string; title: string; category: string; severity: "critical" 
 type CallLog = { at: string; actor: string; method: string; url: string; status: number; ms: number; note?: string; issue?: string };
 type Result = { id: string; verdict: "pass" | "fail" | "skip" | "error" | "pending"; summary: string; observations: string[]; evidence: any; calls: CallLog[]; durationMs: number };
 type PlanStep = { id: string; include: boolean; reason: string };
-type Plan = { steps: PlanStep[]; summary: string; source: "ai" | "rules"; model?: string; target: { name: string; contractBase: string; webhookUrl: string }; contractReachable: boolean; webhookSubscriptions: string[] | null };
+type Plan = { steps: PlanStep[]; summary: string; source: "ai" | "rules" | "ai-recorded"; model?: string; target: { name: string; contractBase: string; webhookUrl: string }; contractReachable: boolean; webhookSubscriptions: string[] | null };
 type Explanation = { id: string; headline: string; rootCause: string; impact: string; fix: { language: string; code: string }; citations: { id: string; title: string; url: string }[]; toolCalls: string[]; source: "ai" | "rules" | "ai-recorded"; recordedAt?: string };
 type Recording = { plan: Plan; results: Result[]; explanations: Explanation[]; recordedAt: string } | null;
 
@@ -260,7 +260,11 @@ export default function App({ catalogue, aiOn, recorded }: { catalogue: Meta[]; 
           <div className="planline">
             <p style={{ margin: 0 }}>{plan.summary}</p>
             <p className="small muted" style={{ margin: "6px 0 0" }}>
-              {plan.source === "ai" ? `Planned by ${plan.model} from your PayPal app's webhook setup and README.` : "Planned with built-in rules."}{" "}
+              {plan.source === "ai"
+                ? `Planned by ${plan.model} from the PayPal app's webhook setup and README.`
+                : plan.source === "ai-recorded"
+                  ? `Gemini's free quota is used up right now, so this is the plan ${plan.model} wrote for the same setup earlier.`
+                  : "Planned with built-in rules."}{" "}
               Webhook subscriptions: {plan.webhookSubscriptions === null ? "none registered for this URL" : plan.webhookSubscriptions.join(", ")}.
             </p>
           </div>

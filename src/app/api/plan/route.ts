@@ -1,5 +1,7 @@
 import { plan } from "@/lib/ai";
 import { PayPal } from "@/lib/paypal";
+import { kv } from "@/lib/store";
+import recorded from "@/data/recorded.json";
 import { originOf, resolveTarget, type TargetInput } from "@/lib/targets";
 
 export const dynamic = "force-dynamic";
@@ -39,6 +41,18 @@ export async function POST(req: Request) {
   const readme = demo
     ? "Kedai Kopi is a demo Malaysian coffee shop on Next.js. Checkout uses PayPal Orders v2 (intent CAPTURE). A webhook handler processes PAYMENT.CAPTURE.* events."
     : await fetchReadme(body.repoUrl);
-  const p = await plan({ targetName: target.name, readme, webhookSubscriptions: subs, contractReachable, demo });
+  const ctx = { targetName: target.name, readme, webhookSubscriptions: subs, contractReachable, demo };
+  const cacheKey = demo ? `plan:v1:${body.target.kind}:${JSON.stringify(subs)}:${contractReachable}` : null;
+  let p: any = cacheKey ? await kv.get(cacheKey) : null;
+  if (!p) {
+    p = await plan(ctx);
+    if (p.source === "ai" && cacheKey) await kv.set(cacheKey, p, 60 * 60 * 6);
+  }
+  // Free-tier Gemini quota runs out quickly; for the demo shop, reuse the plan Gemini
+  // wrote on an earlier run with the same webhook setup (labelled as recorded).
+  if (p.source === "rules" && demo) {
+    const rec = (recorded as any)[body.target.kind === "demo-buggy" ? "buggy" : "fixed"]?.plan;
+    if (rec?.source === "ai") p = { ...rec, source: "ai-recorded" };
+  }
   return Response.json({ ...p, target: { name: target.name, contractBase: target.contractBase, webhookUrl: target.webhookUrl }, contractReachable, webhookSubscriptions: subs });
 }
