@@ -6,7 +6,7 @@
 
 import fs from "node:fs";
 
-const [base, kind, out] = process.argv.slice(2);
+const [base, kind, out, flag] = process.argv.slice(2);
 if (!base || !kind) throw new Error("usage: run-suite.mjs BASE demo-buggy|demo-fixed [out.json]");
 const target = { kind };
 const post = async (path, body) => {
@@ -45,7 +45,7 @@ for (const id of ids.filter((id) => !SLOW.has(id))) fast.push(await runOne(id));
 const results = [...fast, ...(await Promise.all(slow))].sort((a, b) => ids.indexOf(a.id) - ids.indexOf(b.id));
 
 const explanations = [];
-for (const r of results.filter((x) => x.verdict === "fail")) {
+for (const r of flag === "--no-explain" ? [] : results.filter((x) => x.verdict === "fail")) {
   const e = await post("/api/explain", { target, result: r });
   if (e.ok) explanations.push(e.json);
 }

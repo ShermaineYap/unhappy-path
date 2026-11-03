@@ -8,7 +8,7 @@ type CallLog = { at: string; actor: string; method: string; url: string; status:
 type Result = { id: string; verdict: "pass" | "fail" | "skip" | "error" | "pending"; summary: string; observations: string[]; evidence: any; calls: CallLog[]; durationMs: number };
 type PlanStep = { id: string; include: boolean; reason: string };
 type Plan = { steps: PlanStep[]; summary: string; source: "ai" | "rules"; model?: string; target: { name: string; contractBase: string; webhookUrl: string }; contractReachable: boolean; webhookSubscriptions: string[] | null };
-type Explanation = { id: string; headline: string; rootCause: string; impact: string; fix: { language: string; code: string }; citations: { id: string; title: string; url: string }[]; toolCalls: string[]; source: "ai" | "rules" };
+type Explanation = { id: string; headline: string; rootCause: string; impact: string; fix: { language: string; code: string }; citations: { id: string; title: string; url: string }[]; toolCalls: string[]; source: "ai" | "rules" | "ai-recorded"; recordedAt?: string };
 type Recording = { plan: Plan; results: Result[]; explanations: Explanation[]; recordedAt: string } | null;
 
 type TargetKind = "demo-buggy" | "demo-fixed" | "custom";
@@ -376,7 +376,11 @@ export default function App({ catalogue, aiOn, recorded }: { catalogue: Meta[]; 
                         <li key={c.id}><a href={c.url} target="_blank" rel="noreferrer">{c.title}</a></li>
                       ))}
                     </ul>
-                    <p className="small muted">{e.source === "ai" ? "Explanation written by Gemini from the run's evidence and PayPal records." : "Explanation from built-in rules."}</p>
+                    <p className="small muted">{e.source === "ai"
+                        ? "Written by Gemini from this run's evidence and the PayPal records it looked up."
+                        : e.source === "ai-recorded"
+                          ? `Gemini's free quota is used up right now, so this is the explanation it wrote for the same failure on ${new Date(e.recordedAt ?? "").toLocaleDateString()}.`
+                          : "Explanation from built-in rules."}</p>
                   </>
                 )}
                 {!e && <p>{r.summary}</p>}

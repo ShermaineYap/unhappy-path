@@ -3,7 +3,7 @@
 // captures and refunds behind each failure, then writes the explanation and fix.
 // Verdicts and the go-live decision stay deterministic (see scenarios.ts).
 
-import { generateObject, generateText } from "ai";
+import { generateObject } from "ai";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { PayPalAgentToolkit } from "@paypal/agent-toolkit/ai-sdk";
 import { z } from "zod";
@@ -11,7 +11,7 @@ import { DOCS } from "./knowledge";
 import { SCENARIOS, scenarioById, type ScenarioResult } from "./scenarios";
 import type { Creds } from "./paypal";
 
-const MODELS = [process.env.GEMINI_MODEL ?? "gemini-3.8-flash", "gemini-3.5-flash", "gemini-flash-latest", "gemini-flash-lite-latest"].filter(
+const MODELS = [process.env.GEMINI_MODEL ?? "gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash-lite"].filter(
   (m, i, a) => a.indexOf(m) === i,
 );
 export const aiEnabled = () => Boolean(process.env.GOOGLE_GENERATIVE_AI_API_KEY);
@@ -22,7 +22,11 @@ async function withModels<T>(fn: (m: ReturnType<ReturnType<typeof google>>, name
   let last: unknown;
   for (const name of MODELS) {
     try {
-      return { value: await fn(google()(name), name), model: name };
+      const value = await Promise.race([
+        fn(google()(name), name),
+        new Promise<never>((_, no) => setTimeout(() => no(new Error("timed out after 20 s")), 20000)),
+      ]);
+      return { value, model: name };
     } catch (e) {
       last = e;
       console.warn(`gemini ${name} failed: ${String((e as Error)?.message ?? e).slice(0, 120)}`);
@@ -56,7 +60,7 @@ export async function plan(ctx: PlanContext): Promise<Plan> {
     const catalogue = SCENARIOS.map((s) => `- ${s.id} [${s.category}/${s.severity}]: ${s.what} Risk: ${s.risk}`).join("\n");
     const { value: { object }, model: used } = await withModels((m) => generateObject({
       model: m,
-      maxRetries: 1,
+      maxRetries: 0,
       schema: z.object({
         summary: z.string().describe("One or two sentences: what you learned about this integration and how you'll test it."),
         steps: z.array(z.object({ id: z.string(), include: z.boolean(), reason: z.string().describe("Why this scenario matters for THIS integration, max 25 words.") })),
@@ -153,21 +157,45 @@ export async function explain(r: ScenarioResult, creds: Creds, stack = "Next.js 
         context: { sandbox: true },
       },
     });
-    const { value: facts } = await withModels((m) => generateText({
+    // The model chooses which Agent Toolkit tools to call and with what arguments;
+    // our code executes them. (Doing the selection as structured output avoids
+    // multi-turn function-calling, which free-tier Gemini 3 models reject without
+    // thought signatures.)
+    const tools = toolkit.getTools() as Record<string, any>;
+    const toolNames = Object.keys(tools) as [string, ...string[]];
+    const { value: { object: pick } } = await withModels((m) => generateObject({
       model: m,
-      maxRetries: 1,
-      tools: toolkit.getTools(),
-      maxSteps: 4,
+      maxRetries: 0,
+      schema: z.object({
+        calls: z.array(z.object({ tool: z.enum(toolNames), argsJson: z.string().describe("Arguments as a JSON object string, e.g. {\"id\":\"ORDER_ID\"}") })).min(1).max(3),
+      }),
       system:
-        "You are investigating a failed PayPal integration test. Use the PayPal tools to confirm the facts behind the failure " +
-        "(look up the order ids in the evidence). Then state in 3-6 bullet points what PayPal's records show versus what the merchant's system believes.",
+        "You are investigating a failed PayPal integration test. Choose 1-3 PayPal Agent Toolkit calls that confirm what PayPal's records show " +
+        "for the orders in the evidence (e.g. get_order with the order id). Use only ids present in the evidence.\n\nTools:\n" +
+        toolNames.map((n) => `- ${n}: ${String(tools[n].description ?? "").slice(0, 160)}`).join("\n"),
       prompt: `Scenario: ${s.title}\nWhat the agent did: ${s.what}\nResult: ${r.summary}\nObservations: ${r.observations.join(" ")}\nEvidence: ${JSON.stringify(r.evidence).slice(0, 3000)}`,
-      onStepFinish: (st) => st.toolCalls?.forEach((t: any) => toolCalls.push(`${t.toolName}(${JSON.stringify(t.args).slice(0, 80)})`)),
     }));
+    const findings: string[] = [];
+    for (const call of pick.calls) {
+      let args: any = {};
+      try {
+        args = JSON.parse(call.argsJson);
+      } catch {
+        continue;
+      }
+      toolCalls.push(`${call.tool}(${JSON.stringify(args).slice(0, 80)})`);
+      try {
+        const out = await tools[call.tool].execute(args, { toolCallId: crypto.randomUUID(), messages: [] });
+        findings.push(`${call.tool} → ${(typeof out === "string" ? out : JSON.stringify(out)).slice(0, 2500)}`);
+      } catch (e: any) {
+        findings.push(`${call.tool} → error: ${String(e?.message ?? e).slice(0, 200)}`);
+      }
+    }
+    const facts = { text: findings.join("\n\n") || "(no tool results)" };
     // Step 2: structured explanation with citations restricted to the curated docs.
     const { value: { object } } = await withModels((m) => generateObject({
       model: m,
-      maxRetries: 1,
+      maxRetries: 0,
       schema: z.object({
         headline: z.string().describe("Max 14 words, plain English."),
         rootCause: z.string().describe("2-3 sentences: the specific mistake in the merchant's code, grounded in the facts."),
