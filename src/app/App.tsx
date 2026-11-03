@@ -5,7 +5,7 @@ import { useMemo, useState } from "react";
 
 type Meta = { id: string; title: string; category: string; severity: "critical" | "high" | "medium"; what: string; risk: string };
 type CallLog = { at: string; actor: string; method: string; url: string; status: number; ms: number; note?: string; issue?: string };
-type Result = { id: string; verdict: "pass" | "fail" | "skip" | "error"; summary: string; observations: string[]; evidence: any; calls: CallLog[]; durationMs: number };
+type Result = { id: string; verdict: "pass" | "fail" | "skip" | "error" | "pending"; summary: string; observations: string[]; evidence: any; calls: CallLog[]; durationMs: number };
 type PlanStep = { id: string; include: boolean; reason: string };
 type Plan = { steps: PlanStep[]; summary: string; source: "ai" | "rules"; model?: string; target: { name: string; contractBase: string; webhookUrl: string }; contractReachable: boolean; webhookSubscriptions: string[] | null };
 type Explanation = { id: string; headline: string; rootCause: string; impact: string; fix: { language: string; code: string }; citations: { id: string; title: string; url: string }[]; toolCalls: string[]; source: "ai" | "rules" };
@@ -13,7 +13,7 @@ type Recording = { plan: Plan; results: Result[]; explanations: Explanation[]; r
 
 type TargetKind = "demo-buggy" | "demo-fixed" | "custom";
 
-const VERDICT_LABEL = { pass: "Passed", fail: "Failed", skip: "Skipped", error: "Error" } as const;
+const VERDICT_LABEL = { pass: "Passed", fail: "Failed", skip: "Skipped", error: "Error", pending: "Waiting" } as const;
 
 export default function App({ catalogue, aiOn, recorded }: { catalogue: Meta[]; aiOn: boolean; recorded: { buggy: Recording; fixed: Recording } }) {
   const meta = useMemo(() => Object.fromEntries(catalogue.map((m) => [m.id, m])), [catalogue]);
@@ -22,7 +22,7 @@ export default function App({ catalogue, aiOn, recorded }: { catalogue: Meta[]; 
   const [plan, setPlan] = useState<Plan | null>(null);
   const [include, setInclude] = useState<Record<string, boolean>>({});
   const [results, setResults] = useState<Record<string, Result>>({});
-  const [running, setRunning] = useState<string | null>(null);
+  const [runningIds, setRunningIds] = useState<Record<string, boolean>>({});
   const [phase, setPhase] = useState<"idle" | "planning" | "planned" | "running" | "done">("idle");
   const [explanations, setExplanations] = useState<Record<string, Explanation | "loading">>({});
   const [error, setError] = useState<string | null>(null);
@@ -58,28 +58,55 @@ export default function App({ catalogue, aiOn, recorded }: { catalogue: Meta[]; 
     }
   }
 
+  // Scenarios that wait for PayPal's sandbox webhooks (minutes) start first and run in
+  // parallel; the quick ones run one by one meanwhile.
+  const SLOW = new Set(["webhook-replay", "refund-sync"]);
+
+  async function runOne(id: string): Promise<Result> {
+    setRunningIds((p) => ({ ...p, [id]: true }));
+    let state: any = undefined;
+    const calls: CallLog[] = [];
+    const observations: string[] = [];
+    let total = 0;
+    let res: Result;
+    for (;;) {
+      try {
+        const r = await fetch("/api/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ target: target(), scenarioId: id, state }) });
+        const j = await r.json();
+        if (!r.ok) {
+          res = { id, verdict: "error", summary: j.error ?? `HTTP ${r.status}`, observations, evidence: {}, calls, durationMs: total };
+          break;
+        }
+        calls.push(...j.calls);
+        observations.push(...j.observations);
+        total += j.durationMs;
+        res = { ...j, calls: [...calls], observations: [...observations], durationMs: total };
+        if (j.verdict !== "pending") break;
+        setResults((prev) => ({ ...prev, [id]: res }));
+        state = j.state;
+        await new Promise((ok) => setTimeout(ok, j.retryAfterMs ?? 15000));
+        total += j.retryAfterMs ?? 15000;
+      } catch (e: any) {
+        res = { id, verdict: "error", summary: String(e.message ?? e), observations, evidence: {}, calls, durationMs: total };
+        break;
+      }
+    }
+    setResults((prev) => ({ ...prev, [id]: res }));
+    setRunningIds((p) => ({ ...p, [id]: false }));
+    if (res.verdict === "fail") explainOne(res);
+    return res;
+  }
+
   async function doRun() {
     if (!plan) return;
     setResults({});
     setExplanations({});
     setPhase("running");
     const ids = plan.steps.filter((s) => include[s.id]).map((s) => s.id);
-    const got: Result[] = [];
-    for (const id of ids) {
-      setRunning(id);
-      try {
-        const r = await fetch("/api/run", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ target: target(), scenarioId: id }) });
-        const j = await r.json();
-        const res: Result = r.ok ? j : { id, verdict: "error", summary: j.error ?? `HTTP ${r.status}`, observations: [], evidence: {}, calls: [], durationMs: 0 };
-        got.push(res);
-        setResults((prev) => ({ ...prev, [id]: res }));
-      } catch (e: any) {
-        setResults((prev) => ({ ...prev, [id]: { id, verdict: "error", summary: String(e.message ?? e), observations: [], evidence: {}, calls: [], durationMs: 0 } }));
-      }
-    }
-    setRunning(null);
+    const slow = ids.filter((id) => SLOW.has(id)).map((id) => runOne(id));
+    for (const id of ids.filter((id) => !SLOW.has(id))) await runOne(id);
+    await Promise.all(slow);
     setPhase("done");
-    for (const res of got.filter((g) => g.verdict === "fail")) explainOne(res);
   }
 
   async function explainOne(res: Result) {
@@ -243,8 +270,8 @@ export default function App({ catalogue, aiOn, recorded }: { catalogue: Meta[]; 
             {plan.steps.map((step, i) => {
               const m = meta[step.id];
               const r = results[step.id];
-              const isRunning = running === step.id;
-              const cls = r ? r.verdict : isRunning ? "running" : "";
+              const isRunning = !!runningIds[step.id];
+              const cls = r && r.verdict !== "pending" ? r.verdict : isRunning ? "running" : "";
               return (
                 <li key={step.id} className={`row ${cls}`}>
                   <div className="row-main">
@@ -255,14 +282,14 @@ export default function App({ catalogue, aiOn, recorded }: { catalogue: Meta[]; 
                       </h3>
                       <p>{r ? r.summary : step.reason}</p>
                     </div>
-                    {r ? (
+                    {r && r.verdict !== "pending" ? (
                       <span className={`verdict ${r.verdict}`}>{VERDICT_LABEL[r.verdict]}</span>
                     ) : phase === "planned" ? (
                       <label className="toggle">
                         <input type="checkbox" checked={!!include[step.id]} onChange={(e) => setInclude({ ...include, [step.id]: e.target.checked })} /> Run
                       </label>
                     ) : (
-                      <span className="small muted">{include[step.id] ? (isRunning ? "Running" : "Queued") : "Off"}</span>
+                      <span className="small muted">{include[step.id] ? (isRunning ? (r?.verdict === "pending" ? "Waiting for PayPal" : "Running") : "Queued") : "Off"}</span>
                     )}
                   </div>
                   {r && (
@@ -297,7 +324,7 @@ export default function App({ catalogue, aiOn, recorded }: { catalogue: Meta[]; 
             <button className="btn" onClick={doRun} disabled={phase === "running" || phase === "planning"}>
               {phase === "running" ? "Running…" : phase === "done" ? "Run again" : `Run ${Object.values(include).filter(Boolean).length} scenarios`}
             </button>
-            <span className="small muted">Uses real PayPal sandbox calls. A full run takes about 2 minutes because it waits for PayPal&apos;s webhooks.</span>
+            <span className="small muted">Uses real PayPal sandbox calls. A full run takes 3–6 minutes: PayPal&apos;s sandbox delivers webhooks slowly, so those two scenarios run in the background.</span>
           </div>
         </section>
       )}

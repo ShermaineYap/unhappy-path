@@ -6,7 +6,7 @@ import { Contract, Target } from "./contract";
 import { PayPal, TEST_CARD, captureOf, type CallLog } from "./paypal";
 
 export type Severity = "critical" | "high" | "medium";
-export type Verdict = "pass" | "fail" | "skip" | "error";
+export type Verdict = "pass" | "fail" | "skip" | "error" | "pending";
 
 export type ScenarioResult = {
   id: string;
@@ -16,6 +16,10 @@ export type ScenarioResult = {
   evidence: Record<string, unknown>;
   calls: CallLog[];
   durationMs: number;
+  /** Present while verdict is "pending": pass it back to resume the scenario. */
+  state?: Record<string, any>;
+  /** Suggested wait before resuming, ms. */
+  retryAfterMs?: number;
 };
 
 export type Ctx = {
@@ -24,7 +28,14 @@ export type Ctx = {
   target: Target;
   observe: (s: string) => void;
   evidence: Record<string, unknown>;
+  state?: Record<string, any>;
 };
+
+type Outcome = { verdict: Verdict; summary: string; state?: Record<string, any>; retryAfterMs?: number };
+
+/** Long-running scenarios wait for PayPal's sandbox webhooks (often 1-4 minutes),
+ * so they return "pending" with state and the client calls again. */
+const MAX_WAIT_MS = 7 * 60 * 1000;
 
 export type Scenario = {
   id: string;
@@ -34,7 +45,7 @@ export type Scenario = {
   kb: string[];
   what: string; // one line: what the agent does
   risk: string; // one line: what goes wrong in production if this fails
-  run: (c: Ctx) => Promise<{ verdict: Verdict; summary: string }>;
+  run: (c: Ctx) => Promise<Outcome>;
 };
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -48,16 +59,6 @@ async function buyerPays(c: Ctx, opts: { mock?: string; price?: string } = {}) {
   if (conf.status >= 400) throw new Error(`confirm-payment-source failed: ${conf.body?.details?.[0]?.issue ?? conf.status}`);
   const appr = await c.contract.approve(orderId, opts.mock);
   return { orderId, approveStatus: appr.status, approveBody: appr.json };
-}
-
-async function waitFor<T>(fn: () => Promise<T | undefined>, ms: number, every = 3000): Promise<T | undefined> {
-  const end = Date.now() + ms;
-  while (Date.now() < end) {
-    const v = await fn();
-    if (v !== undefined) return v;
-    await sleep(every);
-  }
-  return undefined;
 }
 
 async function merchantWebhook(c: Ctx) {
@@ -211,27 +212,45 @@ export const SCENARIOS: Scenario[] = [
     what: "Pays an order, waits for PayPal's real signed PAYMENT.CAPTURE.COMPLETED webhook, then asks PayPal to resend the same event.",
     risk: "PayPal retries deliveries; without de-duplication you ship the same order twice.",
     async run(c) {
-      const hook = await merchantWebhook(c);
-      if (!hook) return { verdict: "skip", summary: "No registered webhook to replay to (see webhook-config)." };
-      const { orderId } = await buyerPays(c);
-      const pp = await c.pp.call("GET", `/v2/checkout/orders/${orderId}`, undefined, { note: "read capture id" });
-      const capId = captureOf(pp.body)?.id;
-      c.evidence.orderId = orderId;
-      const since = new Date(Date.now() - 10 * 60 * 1000).toISOString().replace(/\.\d+Z$/, "Z");
-      const ev = await waitFor(async () => {
-        const r = await c.pp.call("GET", `/v1/notifications/webhooks-events?page_size=20&event_type=PAYMENT.CAPTURE.COMPLETED&start_time=${since}`, undefined, { note: "look for PayPal's real event" });
-        return (r.body?.events ?? []).find((e: any) => e.resource?.id === capId);
-      }, 45000, 5000);
-      if (!ev) return { verdict: "skip", summary: "PayPal's sandbox didn't emit the capture event within 45 s; try again." };
-      await sleep(2500);
-      const before = await c.contract.probe(orderId, "state after first delivery");
-      await c.pp.call("POST", `/v1/notifications/webhooks-events/${ev.id}/resend`, { webhook_ids: [hook.id] }, { note: "PayPal resends the same signed event" });
-      await sleep(9000);
-      const after = await c.contract.probe(orderId, "state after duplicate delivery");
-      c.evidence = Object.assign(c.evidence, { eventId: ev.id, before, after });
-      c.observe(`Real event ${ev.id} found. Fulfilled ×${before.fulfilled} after first delivery, ×${after.fulfilled} after resend.`);
-      if (after.fulfilled > 1) return { verdict: "fail", summary: `Order fulfilled ${after.fulfilled} times for one payment.` };
-      return { verdict: "pass", summary: "Duplicate delivery de-duplicated." };
+      const st = c.state ?? {};
+      if (!st.phase) {
+        const hook = await merchantWebhook(c);
+        if (!hook) return { verdict: "skip", summary: "No registered webhook to replay to (see webhook-config)." };
+        const { orderId } = await buyerPays(c);
+        const pp = await c.pp.call("GET", `/v2/checkout/orders/${orderId}`, undefined, { note: "read capture id" });
+        const capId = captureOf(pp.body)?.id;
+        if (!capId) return { verdict: "skip", summary: "Order was not captured, so PayPal sends no capture event." };
+        c.observe(`Paid order ${orderId}; waiting for PayPal to deliver its real capture event.`);
+        return { verdict: "pending", summary: "Waiting for PayPal's capture webhook…", retryAfterMs: 15000,
+          state: { phase: "await-event", orderId, capId, hookId: hook.id, t0: Date.now() } };
+      }
+      c.evidence.orderId = st.orderId;
+      if (st.phase === "await-event") {
+        const since = new Date(st.t0 - 5 * 60 * 1000).toISOString().replace(/\.\d+Z$/, "Z");
+        const r = await c.pp.call("GET", `/v1/notifications/webhooks-events?page_size=25&event_type=PAYMENT.CAPTURE.COMPLETED&start_time=${since}`, undefined, { note: "has PayPal emitted the event yet?" });
+        const ev = (r.body?.events ?? []).find((e: any) => e.resource?.id === st.capId);
+        if (!ev) {
+          if (Date.now() - st.t0 > MAX_WAIT_MS) return { verdict: "skip", summary: "PayPal's sandbox didn't emit the capture event within 7 minutes; nothing to replay." };
+          return { verdict: "pending", summary: `Waiting for PayPal's capture webhook (${Math.round((Date.now() - st.t0) / 1000)} s)…`, retryAfterMs: 15000, state: st };
+        }
+        // Give the first delivery time to be processed, then replay it.
+        await sleep(8000);
+        const before = await c.contract.probe(st.orderId, "state after PayPal's first delivery");
+        await c.pp.call("POST", `/v1/notifications/webhooks-events/${ev.id}/resend`, { webhook_ids: [st.hookId] }, { note: "PayPal resends the same signed event" });
+        c.observe(`PayPal emitted ${ev.id}. After the first delivery the merchant had fulfilled ×${before.fulfilled}; asked PayPal to resend it.`);
+        return { verdict: "pending", summary: "Asked PayPal to resend the event; checking for double fulfilment…", retryAfterMs: 15000,
+          state: { ...st, phase: "resent", eventId: ev.id, before, tResent: Date.now() } };
+      }
+      // phase "resent"
+      const after = await c.contract.probe(st.orderId, "state after the duplicate delivery");
+      Object.assign(c.evidence, { eventId: st.eventId, before: st.before, after });
+      if (after.fulfilled > 1) {
+        c.observe(`Event ${st.eventId}: fulfilled ×${st.before.fulfilled} after the first delivery, ×${after.fulfilled} after PayPal's resend.`);
+        return { verdict: "fail", summary: `One payment, ${after.fulfilled} shipments: duplicate deliveries aren't de-duplicated.` };
+      }
+      if (Date.now() - st.tResent < 45000) return { verdict: "pending", summary: "Watching for a second shipment…", retryAfterMs: 15000, state: st };
+      c.observe(`Event ${st.eventId} delivered twice; the merchant still shows a single fulfilment.`);
+      return { verdict: "pass", summary: "Duplicate delivery de-duplicated: shipped once." };
     },
   },
   {
@@ -240,33 +259,48 @@ export const SCENARIOS: Scenario[] = [
     category: "correctness",
     severity: "medium",
     kb: ["refunds", "webhook-events"],
-    what: "Pays an order, refunds it directly through PayPal (as if from the PayPal dashboard), then waits for the merchant's records to change.",
+    what: "Pays an order, refunds it directly through PayPal (as if from the PayPal dashboard), waits for PayPal's refund webhook, then checks the merchant's records.",
     risk: "Your books and stock say 'paid' for money you already gave back.",
     async run(c) {
-      const { orderId } = await buyerPays(c);
-      const pp = await c.pp.call("GET", `/v2/checkout/orders/${orderId}`, undefined, { note: "read capture id" });
-      const capId = captureOf(pp.body)?.id;
-      if (!capId) return { verdict: "skip", summary: "Order was not captured, so there is nothing to refund." };
-      await c.pp.call("POST", `/v2/payments/captures/${capId}/refund`, {}, { note: "full refund via PayPal (dashboard-style)" });
-      const seen = await waitFor(async () => {
-        const p = await c.contract.probe(orderId, "has the refund reached the merchant?");
-        return p.status === "refunded" ? p : undefined;
-      }, 40000, 5000);
-      c.evidence = Object.assign(c.evidence, { orderId, captureId: capId, merchantSawRefund: !!seen });
-      c.observe(seen ? "Merchant marked the order refunded." : "40 s after the refund, the merchant still says the order is paid.");
-      return seen
-        ? { verdict: "pass", summary: "Refund synced via webhook." }
-        : { verdict: "fail", summary: "Merchant never learned about the refund." };
+      const st = c.state ?? {};
+      if (!st.phase) {
+        const { orderId } = await buyerPays(c);
+        const pp = await c.pp.call("GET", `/v2/checkout/orders/${orderId}`, undefined, { note: "read capture id" });
+        const capId = captureOf(pp.body)?.id;
+        if (!capId) return { verdict: "skip", summary: "Order was not captured, so there is nothing to refund." };
+        const rf = await c.pp.call("POST", `/v2/payments/captures/${capId}/refund`, {}, { note: "full refund via PayPal (dashboard-style)" });
+        c.observe(`Paid order ${orderId}, then refunded it through PayPal (refund ${rf.body?.id ?? "?"}).`);
+        return { verdict: "pending", summary: "Refunded through PayPal; waiting for PayPal's refund webhook…", retryAfterMs: 15000,
+          state: { phase: "await", orderId, capId, refundId: rf.body?.id, t0: Date.now() } };
+      }
+      Object.assign(c.evidence, { orderId: st.orderId, captureId: st.capId, refundId: st.refundId });
+      const p = await c.contract.probe(st.orderId, "has the refund reached the merchant?");
+      if (p.status === "refunded") {
+        c.observe("The merchant marked the order refunded.");
+        return { verdict: "pass", summary: "Refund synced via webhook." };
+      }
+      if (!st.deliveredAt) {
+        const since = new Date(st.t0 - 5 * 60 * 1000).toISOString().replace(/\.\d+Z$/, "Z");
+        const r = await c.pp.call("GET", `/v1/notifications/webhooks-events?page_size=25&event_type=PAYMENT.CAPTURE.REFUNDED&start_time=${since}`, undefined, { note: "has PayPal emitted the refund event?" });
+        const ev = (r.body?.events ?? []).find((e: any) => e.resource?.id === st.refundId);
+        if (ev) return { verdict: "pending", summary: "PayPal sent the refund webhook; giving the merchant time to process it…", retryAfterMs: 15000, state: { ...st, deliveredAt: Date.now(), eventId: ev.id } };
+        if (Date.now() - st.t0 > MAX_WAIT_MS) return { verdict: "skip", summary: "PayPal's sandbox didn't emit the refund event within 7 minutes." };
+        return { verdict: "pending", summary: `Waiting for PayPal's refund webhook (${Math.round((Date.now() - st.t0) / 1000)} s)…`, retryAfterMs: 15000, state: st };
+      }
+      if (Date.now() - st.deliveredAt < 60000) return { verdict: "pending", summary: "PayPal sent the refund webhook; giving the merchant time to process it…", retryAfterMs: 15000, state: st };
+      c.evidence.eventId = st.eventId;
+      c.observe(`PayPal emitted refund event ${st.eventId}; a minute later the merchant still says ${p.status}.`);
+      return { verdict: "fail", summary: "PayPal sent the refund webhook, but the merchant still says the order is paid." };
     },
   },
 ];
 
 export const scenarioById = (id: string) => SCENARIOS.find((s) => s.id === id);
 
-export async function runScenario(s: Scenario, target: Target, pp: PayPal, contract: Contract, calls: CallLog[]): Promise<ScenarioResult> {
+export async function runScenario(s: Scenario, target: Target, pp: PayPal, contract: Contract, calls: CallLog[], state?: Record<string, any>): Promise<ScenarioResult> {
   const t0 = Date.now();
   const observations: string[] = [];
-  const ctx: Ctx = { pp, contract, target, observe: (o) => observations.push(o), evidence: {} };
+  const ctx: Ctx = { pp, contract, target, observe: (o) => observations.push(o), evidence: {}, state };
   try {
     const r = await s.run(ctx);
     return { id: s.id, ...r, observations, evidence: ctx.evidence, calls, durationMs: Date.now() - t0 };
