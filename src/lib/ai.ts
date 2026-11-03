@@ -11,9 +11,25 @@ import { DOCS } from "./knowledge";
 import { SCENARIOS, scenarioById, type ScenarioResult } from "./scenarios";
 import type { Creds } from "./paypal";
 
-const MODEL = process.env.GEMINI_MODEL ?? "gemini-2.5-flash";
+const MODELS = [process.env.GEMINI_MODEL ?? "gemini-3.8-flash", "gemini-3.5-flash", "gemini-flash-latest", "gemini-flash-lite-latest"].filter(
+  (m, i, a) => a.indexOf(m) === i,
+);
 export const aiEnabled = () => Boolean(process.env.GOOGLE_GENERATIVE_AI_API_KEY);
-const model = () => createGoogleGenerativeAI({ apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY })(MODEL);
+const google = () => createGoogleGenerativeAI({ apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY });
+
+/** Free-tier Gemini models are often busy; fall through to the next model instead of failing. */
+async function withModels<T>(fn: (m: ReturnType<ReturnType<typeof google>>, name: string) => Promise<T>): Promise<{ value: T; model: string }> {
+  let last: unknown;
+  for (const name of MODELS) {
+    try {
+      return { value: await fn(google()(name), name), model: name };
+    } catch (e) {
+      last = e;
+      console.warn(`gemini ${name} failed: ${String((e as Error)?.message ?? e).slice(0, 120)}`);
+    }
+  }
+  throw last;
+}
 
 export type PlanStep = { id: string; include: boolean; reason: string };
 export type Plan = { steps: PlanStep[]; summary: string; source: "ai" | "rules"; model?: string };
@@ -38,25 +54,29 @@ export async function plan(ctx: PlanContext): Promise<Plan> {
   if (!aiEnabled()) return rulesPlan(ctx);
   try {
     const catalogue = SCENARIOS.map((s) => `- ${s.id} [${s.category}/${s.severity}]: ${s.what} Risk: ${s.risk}`).join("\n");
-    const { object } = await generateObject({
-      model: model(),
+    const { value: { object }, model: used } = await withModels((m) => generateObject({
+      model: m,
+      maxRetries: 1,
       schema: z.object({
         summary: z.string().describe("One or two sentences: what you learned about this integration and how you'll test it."),
         steps: z.array(z.object({ id: z.string(), include: z.boolean(), reason: z.string().describe("Why this scenario matters for THIS integration, max 25 words.") })),
       }),
       system:
         "You are Unhappy Path, an agent that crash-tests PayPal sandbox integrations before go-live. Plan which scenarios to run and in what order. " +
-        "Order: configuration first, then security (critical) first, then correctness. Exclude a scenario only when it cannot apply (e.g. webhook-replay when no webhook is registered). " +
+        "Order: configuration first, then security (critical) first, then correctness. Always include webhook-config. Exclude a scenario only when it cannot apply (e.g. webhook-replay when no webhook is registered). " +
         "Ground every reason in the evidence given; do not invent facts about the merchant.",
       prompt:
         `Target: ${ctx.targetName}\nTest contract reachable: ${ctx.contractReachable}\n` +
         `Webhook subscriptions on the PayPal app for this URL: ${ctx.webhookSubscriptions === null ? "NONE REGISTERED" : (ctx.webhookSubscriptions ?? []).join(", ") || "unknown"}\n` +
         `README excerpt:\n${(ctx.readme ?? "(none provided)").slice(0, 6000)}\n\nScenario catalogue:\n${catalogue}`,
-    });
+    }));
     const known = new Set(SCENARIOS.map((s) => s.id));
     const steps = object.steps.filter((s) => known.has(s.id));
     for (const s of SCENARIOS) if (!steps.find((x) => x.id === s.id)) steps.push({ id: s.id, include: true, reason: s.risk });
-    return { source: "ai", model: MODEL, summary: object.summary, steps };
+    // The configuration check is always useful: a missing webhook is itself the finding.
+    const cfg = steps.find((x) => x.id === "webhook-config");
+    if (cfg && !cfg.include) Object.assign(cfg, { include: true, reason: "No webhook is registered for this URL, which is itself a finding worth recording." });
+    return { source: "ai", model: used, summary: object.summary, steps };
   } catch (e) {
     console.error("planner failed, using rules", e);
     return rulesPlan(ctx);
@@ -133,8 +153,9 @@ export async function explain(r: ScenarioResult, creds: Creds, stack = "Next.js 
         context: { sandbox: true },
       },
     });
-    const facts = await generateText({
-      model: model(),
+    const { value: facts } = await withModels((m) => generateText({
+      model: m,
+      maxRetries: 1,
       tools: toolkit.getTools(),
       maxSteps: 4,
       system:
@@ -142,10 +163,11 @@ export async function explain(r: ScenarioResult, creds: Creds, stack = "Next.js 
         "(look up the order ids in the evidence). Then state in 3-6 bullet points what PayPal's records show versus what the merchant's system believes.",
       prompt: `Scenario: ${s.title}\nWhat the agent did: ${s.what}\nResult: ${r.summary}\nObservations: ${r.observations.join(" ")}\nEvidence: ${JSON.stringify(r.evidence).slice(0, 3000)}`,
       onStepFinish: (st) => st.toolCalls?.forEach((t: any) => toolCalls.push(`${t.toolName}(${JSON.stringify(t.args).slice(0, 80)})`)),
-    });
+    }));
     // Step 2: structured explanation with citations restricted to the curated docs.
-    const { object } = await generateObject({
-      model: model(),
+    const { value: { object } } = await withModels((m) => generateObject({
+      model: m,
+      maxRetries: 1,
       schema: z.object({
         headline: z.string().describe("Max 14 words, plain English."),
         rootCause: z.string().describe("2-3 sentences: the specific mistake in the merchant's code, grounded in the facts."),
@@ -158,7 +180,7 @@ export async function explain(r: ScenarioResult, creds: Creds, stack = "Next.js 
       prompt:
         `Scenario: ${s.title} (${s.severity})\nRisk: ${s.risk}\nResult: ${r.summary}\nObservations: ${r.observations.join(" ")}\n` +
         `Investigation notes (from PayPal Agent Toolkit):\n${facts.text}\n\nDocs you may cite:\n${DOCS.map((d) => `- ${d.id}: ${d.title} — ${d.gist}`).join("\n")}`,
-    });
+    }));
     return {
       id: r.id,
       headline: object.headline,
