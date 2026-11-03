@@ -12,6 +12,10 @@ const compat = new FlatCompat({
 const eslintConfig = [
   ...compat.extends("next/core-web-vitals", "next/typescript"),
   {
+    // PayPal REST payloads are untyped JSON; we validate fields where we use them.
+    rules: { "@typescript-eslint/no-explicit-any": "off" },
+  },
+  {
     ignores: [
       "node_modules/**",
       ".next/**",
