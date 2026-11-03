@@ -146,7 +146,7 @@ export default function App({ catalogue, aiOn, recorded }: { catalogue: Meta[]; 
         </Link>
         <nav>
           <a href="#contract">Test your own app</a>
-          <a href="https://github.com/" id="gh-link">Source code</a>
+          <a href="https://github.com/ShermaineYap/unhappy-path">Source code</a>
         </nav>
       </header>
 

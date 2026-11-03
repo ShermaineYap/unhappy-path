@@ -6,7 +6,7 @@ Unhappy Path is an AI agent that crash-tests a PayPal **sandbox** integration. I
 
 Built solo for the [PayPal AI Hackathon 2026](https://paypalaihackathon.devpost.com/).
 
-- **Live demo:** _added at deploy_
+- **Live demo:** https://unhappy-path.vercel.app
 - **Video:** _added at submission_
 
 ## Why
