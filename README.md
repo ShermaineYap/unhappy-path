@@ -37,7 +37,11 @@ Without a Gemini key the app still works: plans and fixes fall back to built-in 
 
 ## PayPal APIs used
 
-Orders v2 (create, confirm-payment-source, capture, get), Payments v2 (refund), Webhooks management (list webhooks), Webhook events (list, **resend**), Webhook signature verification (demo store), sandbox negative testing (`PayPal-Mock-Response`), Agent Toolkit (`get_order`, `list_transactions`, `get_refund`, `list_disputes`, `get_dispute`).
+Orders v2 (create, PATCH, confirm-payment-source, capture, get, **add tracking**, update tracker), Payments v2 (get capture, refund), Webhooks management (list webhooks), Webhook events (list, **resend**), Webhook signature verification (demo store), sandbox negative testing (`PayPal-Mock-Response`), Agent Toolkit (`get_order`, `list_transactions`, `get_refund`, `list_disputes`, `get_dispute`).
+
+## The demo shop keeps its books in PayPal
+
+Kedai Kopi has no database. Every shipment is a PayPal shipment tracker on the order (`POST /v2/checkout/orders/{id}/track`), a refund cancels the tracker, and notes made before capture live in the order's `custom_id`. The probe reads only these merchant-written records, never PayPal's own payment status, so the buggy build really does believe the wrong things. The fixed build makes fulfilment idempotent with a per-order `PayPal-Request-Id`.
 
 ## Try it
 
@@ -82,7 +86,6 @@ and set the printed fixed-mode webhook ID as `PAYPAL_WEBHOOK_ID_FIXED`.
 | `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET` | yes | Sandbox app (US business account recommended) for the demo store |
 | `PAYPAL_WEBHOOK_ID_FIXED` | for the fixed demo | From `register-webhooks.mjs` |
 | `GOOGLE_GENERATIVE_AI_API_KEY` | no | Enables the AI planner and investigator (free tier works) |
-| `KV_REST_API_URL`, `KV_REST_API_TOKEN` | on Vercel | Upstash Redis for demo-store state; in-memory when absent |
 | `PUBLIC_BASE_URL` | no | Override the detected origin |
 
 ## Honest limitations
