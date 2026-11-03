@@ -27,10 +27,14 @@ Most PayPal integrations are only ever tested on the happy path. The failures th
 
 The **go-live verdict is computed by rules**: any failed critical or high scenario blocks go-live, and the AI cannot override it.
 
+## Measured results
+
+Five full runs against each demo shop on the live deployment (70 scenario runs): **all 25 planted failures caught, 0 missed, 0 false alarms, 0 skips**, verdicts identical across runs. Median run time 162 s (buggy) / 143 s (fixed), mostly waiting for PayPal's sandbox webhooks. Details: [`study/RESULTS.md`](study/RESULTS.md).
+
 ## How the AI is used
 
 1. **Planner** (Gemini via Vercel AI SDK): reads your PayPal app's webhook configuration, whether your test contract responds, and your repo's README, then chooses and orders the scenarios with a reason for each.
-2. **Investigator** (Gemini + **PayPal Agent Toolkit** `@paypal/agent-toolkit`): for each failure it calls Toolkit tools such as `get_order`, `list_transactions` and `get_refund` to confirm what PayPal's records show versus what your shop believes.
+2. **Investigator** (Gemini + **PayPal Agent Toolkit** `@paypal/agent-toolkit`): for each failure the model chooses Toolkit calls such as `get_order`, `list_transactions` and `get_refund` (as structured output), our code executes them, and the results ground the explanation in what PayPal's records show versus what your shop believes.
 3. **Fix writer**: turns the evidence into a root cause, impact and a minimal code fix. Citations are restricted to a curated list of PayPal docs (`src/lib/knowledge.ts`), so links can't be invented.
 
 Without a Gemini key the app still works: plans and fixes fall back to built-in rules.
@@ -92,7 +96,8 @@ and set the printed fixed-mode webhook ID as `PAYPAL_WEBHOOK_ID_FIXED`.
 
 - Sandbox only, by design. Production keys are rejected.
 - Your app must implement the three-endpoint test contract; without it, only the webhook-configuration check runs.
-- PayPal's sandbox sometimes delays webhook events; the duplicate-delivery scenario waits up to 45 s and reports **Skipped** rather than guessing.
+- PayPal's sandbox delivers webhooks slowly (often 1–2 minutes). The two webhook scenarios resume across requests and wait up to 7 minutes for PayPal's real event; if it never arrives they report **Skipped** rather than guessing.
+- Free-tier Gemini quotas run out quickly. The app falls back across several Gemini models; for the demo shop it then shows the explanation Gemini wrote for the same failure on an earlier run (labelled), and for your own app it uses built-in rules.
 - Disputes are not yet covered: creating a sandbox dispute requires the buyer UI, so it isn't automated.
 - The `CCREJECT-*` cardholder-name decline trigger from PayPal's card-testing docs did not decline Orders v2 card payments in our tests; Unhappy Path uses `PayPal-Mock-Response` instead.
 

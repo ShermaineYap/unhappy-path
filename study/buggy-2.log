@@ -1,0 +1,8 @@
+pass  webhook-config   0.3s  All money events are subscribed.
+fail  price-tampering  3.3s  The merchant created a PayPal order for 0.01 instead of 25.00.
+fail  forged-webhook   3.5s  A forged, unsigned webhook marked an unpaid order as paid.
+pass  happy-path       6.9s  Paid once, fulfilled once.
+fail  declined-capture 3.7s  The merchant marked a declined payment as paid and fulfilled it.
+fail  webhook-replay   97.8s  One payment, 2 shipments: duplicate deliveries aren't de-duplicated.
+fail  refund-sync      123.6s  PayPal sent the refund webhook, but the merchant still says the order is paid.
+total 131s, 0 explanations ()

@@ -1,0 +1,8 @@
+pass  webhook-config   0.4s  All money events are subscribed.
+pass  price-tampering  2.3s  Both orders are 25.00; the client price was ignored.
+pass  forged-webhook   3.2s  Forged webhook ignored (HTTP 400).
+pass  happy-path       7.9s  Paid once, fulfilled once.
+pass  declined-capture 4.3s  Decline handled: order stays unpaid.
+pass  refund-sync      40.4s  Refund synced via webhook.
+pass  webhook-replay   127.0s  Duplicate delivery de-duplicated: shipped once.
+total 143s, 0 explanations ()

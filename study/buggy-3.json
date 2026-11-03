@@ -1,0 +1,632 @@
+{
+  "plan": {
+    "source": "ai",
+    "model": "gemini-flash-lite-latest",
+    "summary": "Kedai Kopi runs Next.js using PayPal Orders v2 with webhook handling for captures and disputes. We will test configuration, critical security, and correctness.",
+    "steps": [
+      {
+        "id": "webhook-config",
+        "include": true,
+        "reason": "Verify webhook subscriptions on the PayPal app include required events like captures, denials, refunds, and disputes."
+      },
+      {
+        "id": "price-tampering",
+        "include": true,
+        "reason": "Critical security check to ensure malicious users cannot inject lower prices into the checkout request."
+      },
+      {
+        "id": "forged-webhook",
+        "include": true,
+        "reason": "Critical security check to ensure fake webhooks with invalid signatures cannot mark unpaid orders as paid."
+      },
+      {
+        "id": "happy-path",
+        "include": true,
+        "reason": "Verify basic checkout and capture work properly between the merchant and PayPal sandbox."
+      },
+      {
+        "id": "declined-capture",
+        "include": true,
+        "reason": "Ensure the merchant does not fulfill orders when payment capture is declined by PayPal."
+      },
+      {
+        "id": "webhook-replay",
+        "include": true,
+        "reason": "Check for proper webhook de-duplication to prevent shipping the same order twice on retries."
+      },
+      {
+        "id": "refund-sync",
+        "include": true,
+        "reason": "Ensure refunds issued directly through the PayPal dashboard correctly sync to merchant records."
+      }
+    ],
+    "target": {
+      "name": "Kedai Kopi (buggy build)",
+      "contractBase": "https://unhappy-path.vercel.app/api/demo/buggy",
+      "webhookUrl": "https://unhappy-path.vercel.app/api/demo/buggy/webhook"
+    },
+    "contractReachable": true,
+    "webhookSubscriptions": [
+      "CUSTOMER.DISPUTE.CREATED",
+      "CUSTOMER.DISPUTE.RESOLVED",
+      "CUSTOMER.DISPUTE.UPDATED",
+      "PAYMENT.CAPTURE.COMPLETED",
+      "PAYMENT.CAPTURE.DENIED",
+      "PAYMENT.CAPTURE.REFUNDED"
+    ]
+  },
+  "results": [
+    {
+      "id": "webhook-config",
+      "verdict": "pass",
+      "summary": "All money events are subscribed.",
+      "observations": [
+        "Subscribed: CUSTOMER.DISPUTE.CREATED, CUSTOMER.DISPUTE.RESOLVED, CUSTOMER.DISPUTE.UPDATED, PAYMENT.CAPTURE.COMPLETED, PAYMENT.CAPTURE.DENIED, PAYMENT.CAPTURE.REFUNDED."
+      ],
+      "evidence": {
+        "subscribed": [
+          "CUSTOMER.DISPUTE.CREATED",
+          "CUSTOMER.DISPUTE.RESOLVED",
+          "CUSTOMER.DISPUTE.UPDATED",
+          "PAYMENT.CAPTURE.COMPLETED",
+          "PAYMENT.CAPTURE.DENIED",
+          "PAYMENT.CAPTURE.REFUNDED"
+        ],
+        "missing": []
+      },
+      "calls": [
+        {
+          "at": "2026-11-03T09:53:40.403Z",
+          "actor": "unhappy-path",
+          "method": "GET",
+          "url": "/v1/notifications/webhooks",
+          "status": 200,
+          "ms": 324,
+          "note": "list webhook subscriptions"
+        }
+      ],
+      "durationMs": 484,
+      "activeMs": 329
+    },
+    {
+      "id": "price-tampering",
+      "verdict": "fail",
+      "summary": "The merchant created a PayPal order for 0.01 instead of 25.00.",
+      "observations": [
+        "Normal checkout → PayPal order for 25.00. Tampered checkout → PayPal order for 0.01."
+      ],
+      "evidence": {
+        "normal": {
+          "orderId": "5FY70368324515019",
+          "amount": "25.00"
+        },
+        "tampered": {
+          "orderId": "4FM869825R2850841",
+          "amount": "0.01"
+        }
+      },
+      "calls": [
+        {
+          "at": "2026-11-03T09:53:41.232Z",
+          "actor": "merchant",
+          "method": "POST",
+          "url": "/api/demo/buggy/checkout",
+          "status": 200,
+          "ms": 764,
+          "note": "checkout"
+        },
+        {
+          "at": "2026-11-03T09:53:42.296Z",
+          "actor": "merchant",
+          "method": "POST",
+          "url": "/api/demo/buggy/checkout",
+          "status": 200,
+          "ms": 1064,
+          "note": "checkout with tampered client price 0.01"
+        },
+        {
+          "at": "2026-11-03T09:53:42.513Z",
+          "actor": "unhappy-path",
+          "method": "GET",
+          "url": "/v2/checkout/orders/5FY70368324515019",
+          "status": 200,
+          "ms": 216,
+          "note": "amount of normal order"
+        },
+        {
+          "at": "2026-11-03T09:53:42.933Z",
+          "actor": "unhappy-path",
+          "method": "GET",
+          "url": "/v2/checkout/orders/4FM869825R2850841",
+          "status": 200,
+          "ms": 419,
+          "note": "amount of tampered order"
+        }
+      ],
+      "durationMs": 2525,
+      "activeMs": 2466
+    },
+    {
+      "id": "forged-webhook",
+      "verdict": "fail",
+      "summary": "A forged, unsigned webhook marked an unpaid order as paid.",
+      "observations": [
+        "Webhook endpoint answered HTTP 200. Unpaid order now shows paid, fulfilled ×1."
+      ],
+      "evidence": {
+        "orderId": "217527811N0389301",
+        "webhookHttp": 200,
+        "merchant": {
+          "status": "paid",
+          "fulfilled": 1,
+          "amount": "25.00"
+        }
+      },
+      "calls": [
+        {
+          "at": "2026-11-03T09:53:43.533Z",
+          "actor": "merchant",
+          "method": "POST",
+          "url": "/api/demo/buggy/checkout",
+          "status": 200,
+          "ms": 536,
+          "note": "checkout"
+        },
+        {
+          "at": "2026-11-03T09:53:44.437Z",
+          "actor": "merchant",
+          "method": "POST",
+          "url": "/api/demo/buggy/webhook",
+          "status": 200,
+          "ms": 904,
+          "note": "forged PAYMENT.CAPTURE.COMPLETED (bad signature)"
+        },
+        {
+          "at": "2026-11-03T09:53:46.195Z",
+          "actor": "merchant",
+          "method": "GET",
+          "url": "/api/demo/buggy/probe",
+          "status": 200,
+          "ms": 257,
+          "note": "probe merchant state"
+        }
+      ],
+      "durationMs": 3260,
+      "activeMs": 3198
+    },
+    {
+      "id": "happy-path",
+      "verdict": "pass",
+      "summary": "Paid once, fulfilled once.",
+      "observations": [
+        "PayPal says COMPLETED/COMPLETED; merchant says paid, fulfilled ×1 (approve returned 200)."
+      ],
+      "evidence": {
+        "orderId": "9WS83408VA830950P",
+        "paypal": {
+          "status": "COMPLETED",
+          "capture": "COMPLETED"
+        },
+        "merchant": {
+          "status": "paid",
+          "fulfilled": 1,
+          "amount": "25.00"
+        }
+      },
+      "calls": [
+        {
+          "at": "2026-11-03T09:53:47.076Z",
+          "actor": "merchant",
+          "method": "POST",
+          "url": "/api/demo/buggy/checkout",
+          "status": 200,
+          "ms": 810,
+          "note": "checkout"
+        },
+        {
+          "at": "2026-11-03T09:53:48.333Z",
+          "actor": "unhappy-path",
+          "method": "POST",
+          "url": "/v2/checkout/orders/9WS83408VA830950P/confirm-payment-source",
+          "status": 200,
+          "ms": 1256,
+          "note": "buyer pays with sandbox test card"
+        },
+        {
+          "at": "2026-11-03T09:53:52.438Z",
+          "actor": "merchant",
+          "method": "POST",
+          "url": "/api/demo/buggy/approve",
+          "status": 200,
+          "ms": 4105,
+          "note": "approve → merchant captures"
+        },
+        {
+          "at": "2026-11-03T09:53:53.495Z",
+          "actor": "unhappy-path",
+          "method": "GET",
+          "url": "/v2/checkout/orders/9WS83408VA830950P",
+          "status": 200,
+          "ms": 1056,
+          "note": "read order from PayPal"
+        },
+        {
+          "at": "2026-11-03T09:53:54.261Z",
+          "actor": "merchant",
+          "method": "GET",
+          "url": "/api/demo/buggy/probe",
+          "status": 200,
+          "ms": 766,
+          "note": "probe merchant state"
+        }
+      ],
+      "durationMs": 8078,
+      "activeMs": 7996
+    },
+    {
+      "id": "declined-capture",
+      "verdict": "fail",
+      "summary": "The merchant marked a declined payment as paid and fulfilled it.",
+      "observations": [
+        "PayPal order is APPROVED (never captured). Merchant /approve answered 200; merchant now says paid, fulfilled ×1."
+      ],
+      "evidence": {
+        "orderId": "3FL25793NH300044C",
+        "paypalStatus": "APPROVED",
+        "approveStatus": 200,
+        "approveBody": {
+          "ok": true,
+          "status": "paid"
+        },
+        "merchant": {
+          "status": "paid",
+          "fulfilled": 1,
+          "amount": "25.00"
+        }
+      },
+      "calls": [
+        {
+          "at": "2026-11-03T09:53:54.906Z",
+          "actor": "merchant",
+          "method": "POST",
+          "url": "/api/demo/buggy/checkout",
+          "status": 200,
+          "ms": 498,
+          "note": "checkout"
+        },
+        {
+          "at": "2026-11-03T09:53:56.157Z",
+          "actor": "unhappy-path",
+          "method": "POST",
+          "url": "/v2/checkout/orders/3FL25793NH300044C/confirm-payment-source",
+          "status": 200,
+          "ms": 1248,
+          "note": "buyer pays with sandbox test card"
+        },
+        {
+          "at": "2026-11-03T09:53:57.291Z",
+          "actor": "merchant",
+          "method": "POST",
+          "url": "/api/demo/buggy/approve",
+          "status": 200,
+          "ms": 1134,
+          "note": "approve (PayPal will answer INSTRUMENT_DECLINED)"
+        },
+        {
+          "at": "2026-11-03T09:53:57.699Z",
+          "actor": "unhappy-path",
+          "method": "GET",
+          "url": "/v2/checkout/orders/3FL25793NH300044C",
+          "status": 200,
+          "ms": 407,
+          "note": "read order from PayPal"
+        },
+        {
+          "at": "2026-11-03T09:53:58.029Z",
+          "actor": "merchant",
+          "method": "GET",
+          "url": "/api/demo/buggy/probe",
+          "status": 200,
+          "ms": 330,
+          "note": "probe merchant state"
+        }
+      ],
+      "durationMs": 3757,
+      "activeMs": 3622
+    },
+    {
+      "id": "webhook-replay",
+      "verdict": "fail",
+      "summary": "One payment, 2 shipments: duplicate deliveries aren't de-duplicated.",
+      "observations": [
+        "Paid order 4W387959R63387820; waiting for PayPal to deliver its real capture event.",
+        "PayPal emitted WH-43C495842V061874W-0V716663BN5833247. After the first delivery the merchant had fulfilled ×2; asked PayPal to resend it.",
+        "Event WH-43C495842V061874W-0V716663BN5833247: fulfilled ×2 after the first delivery, ×2 after PayPal's resend."
+      ],
+      "evidence": {
+        "orderId": "4W387959R63387820",
+        "eventId": "WH-43C495842V061874W-0V716663BN5833247",
+        "before": {
+          "status": "paid",
+          "fulfilled": 2,
+          "amount": "25.00"
+        },
+        "after": {
+          "status": "paid",
+          "fulfilled": 2,
+          "amount": "25.00"
+        }
+      },
+      "calls": [
+        {
+          "at": "2026-11-03T09:53:40.303Z",
+          "actor": "unhappy-path",
+          "method": "GET",
+          "url": "/v1/notifications/webhooks",
+          "status": 200,
+          "ms": 312,
+          "note": "list webhook subscriptions"
+        },
+        {
+          "at": "2026-11-03T09:53:40.970Z",
+          "actor": "merchant",
+          "method": "POST",
+          "url": "/api/demo/buggy/checkout",
+          "status": 200,
+          "ms": 667,
+          "note": "checkout"
+        },
+        {
+          "at": "2026-11-03T09:53:42.017Z",
+          "actor": "unhappy-path",
+          "method": "POST",
+          "url": "/v2/checkout/orders/4W387959R63387820/confirm-payment-source",
+          "status": 200,
+          "ms": 1046,
+          "note": "buyer pays with sandbox test card"
+        },
+        {
+          "at": "2026-11-03T09:53:45.728Z",
+          "actor": "merchant",
+          "method": "POST",
+          "url": "/api/demo/buggy/approve",
+          "status": 200,
+          "ms": 3711,
+          "note": "approve → merchant captures"
+        },
+        {
+          "at": "2026-11-03T09:53:46.371Z",
+          "actor": "unhappy-path",
+          "method": "GET",
+          "url": "/v2/checkout/orders/4W387959R63387820",
+          "status": 200,
+          "ms": 642,
+          "note": "read capture id"
+        },
+        {
+          "at": "2026-11-03T09:54:02.107Z",
+          "actor": "unhappy-path",
+          "method": "GET",
+          "url": "/v1/notifications/webhooks-events",
+          "status": 200,
+          "ms": 639,
+          "note": "has PayPal emitted the event yet?"
+        },
+        {
+          "at": "2026-11-03T09:54:17.670Z",
+          "actor": "unhappy-path",
+          "method": "GET",
+          "url": "/v1/notifications/webhooks-events",
+          "status": 200,
+          "ms": 350,
+          "note": "has PayPal emitted the event yet?"
+        },
+        {
+          "at": "2026-11-03T09:54:26.345Z",
+          "actor": "merchant",
+          "method": "GET",
+          "url": "/api/demo/buggy/probe",
+          "status": 200,
+          "ms": 675,
+          "note": "state after PayPal's first delivery"
+        },
+        {
+          "at": "2026-11-03T09:54:26.727Z",
+          "actor": "unhappy-path",
+          "method": "POST",
+          "url": "/v1/notifications/webhooks-events/WH-43C495842V061874W-0V716663BN5833247/resend",
+          "status": 404,
+          "ms": 381,
+          "note": "PayPal resends the same signed event",
+          "issue": "INVALID_RESOURCE_ID"
+        },
+        {
+          "at": "2026-11-03T09:54:42.670Z",
+          "actor": "merchant",
+          "method": "GET",
+          "url": "/api/demo/buggy/probe",
+          "status": 200,
+          "ms": 678,
+          "note": "state after the duplicate delivery"
+        }
+      ],
+      "durationMs": 62748,
+      "activeMs": 17108
+    },
+    {
+      "id": "refund-sync",
+      "verdict": "fail",
+      "summary": "PayPal sent the refund webhook, but the merchant still says the order is paid.",
+      "observations": [
+        "Paid order 10U01733X4791153A, then refunded it through PayPal (refund 9T965717S1586561R).",
+        "PayPal emitted refund event WH-0E014914KU478980N-22T45419K6768360B; a minute later the merchant still says paid."
+      ],
+      "evidence": {
+        "orderId": "10U01733X4791153A",
+        "captureId": "1VY894060K002372Y",
+        "refundId": "9T965717S1586561R",
+        "eventId": "WH-0E014914KU478980N-22T45419K6768360B"
+      },
+      "calls": [
+        {
+          "at": "2026-11-03T09:53:40.714Z",
+          "actor": "merchant",
+          "method": "POST",
+          "url": "/api/demo/buggy/checkout",
+          "status": 200,
+          "ms": 705,
+          "note": "checkout"
+        },
+        {
+          "at": "2026-11-03T09:53:41.963Z",
+          "actor": "unhappy-path",
+          "method": "POST",
+          "url": "/v2/checkout/orders/10U01733X4791153A/confirm-payment-source",
+          "status": 200,
+          "ms": 1248,
+          "note": "buyer pays with sandbox test card"
+        },
+        {
+          "at": "2026-11-03T09:53:45.783Z",
+          "actor": "merchant",
+          "method": "POST",
+          "url": "/api/demo/buggy/approve",
+          "status": 200,
+          "ms": 3820,
+          "note": "approve → merchant captures"
+        },
+        {
+          "at": "2026-11-03T09:53:46.728Z",
+          "actor": "unhappy-path",
+          "method": "GET",
+          "url": "/v2/checkout/orders/10U01733X4791153A",
+          "status": 200,
+          "ms": 944,
+          "note": "read capture id"
+        },
+        {
+          "at": "2026-11-03T09:53:48.368Z",
+          "actor": "unhappy-path",
+          "method": "POST",
+          "url": "/v2/payments/captures/1VY894060K002372Y/refund",
+          "status": 201,
+          "ms": 1639,
+          "note": "full refund via PayPal (dashboard-style)"
+        },
+        {
+          "at": "2026-11-03T09:54:04.471Z",
+          "actor": "merchant",
+          "method": "GET",
+          "url": "/api/demo/buggy/probe",
+          "status": 200,
+          "ms": 1012,
+          "note": "has the refund reached the merchant?"
+        },
+        {
+          "at": "2026-11-03T09:54:04.718Z",
+          "actor": "unhappy-path",
+          "method": "GET",
+          "url": "/v1/notifications/webhooks-events",
+          "status": 200,
+          "ms": 246,
+          "note": "has PayPal emitted the refund event?"
+        },
+        {
+          "at": "2026-11-03T09:54:20.633Z",
+          "actor": "merchant",
+          "method": "GET",
+          "url": "/api/demo/buggy/probe",
+          "status": 200,
+          "ms": 797,
+          "note": "has the refund reached the merchant?"
+        },
+        {
+          "at": "2026-11-03T09:54:20.962Z",
+          "actor": "unhappy-path",
+          "method": "GET",
+          "url": "/v1/notifications/webhooks-events",
+          "status": 200,
+          "ms": 329,
+          "note": "has PayPal emitted the refund event?"
+        },
+        {
+          "at": "2026-11-03T09:54:37.009Z",
+          "actor": "merchant",
+          "method": "GET",
+          "url": "/api/demo/buggy/probe",
+          "status": 200,
+          "ms": 884,
+          "note": "has the refund reached the merchant?"
+        },
+        {
+          "at": "2026-11-03T09:54:37.318Z",
+          "actor": "unhappy-path",
+          "method": "GET",
+          "url": "/v1/notifications/webhooks-events",
+          "status": 200,
+          "ms": 308,
+          "note": "has PayPal emitted the refund event?"
+        },
+        {
+          "at": "2026-11-03T09:54:53.458Z",
+          "actor": "merchant",
+          "method": "GET",
+          "url": "/api/demo/buggy/probe",
+          "status": 200,
+          "ms": 996,
+          "note": "has the refund reached the merchant?"
+        },
+        {
+          "at": "2026-11-03T09:54:53.749Z",
+          "actor": "unhappy-path",
+          "method": "GET",
+          "url": "/v1/notifications/webhooks-events",
+          "status": 200,
+          "ms": 291,
+          "note": "has PayPal emitted the refund event?"
+        },
+        {
+          "at": "2026-11-03T09:55:09.865Z",
+          "actor": "merchant",
+          "method": "GET",
+          "url": "/api/demo/buggy/probe",
+          "status": 200,
+          "ms": 926,
+          "note": "has the refund reached the merchant?"
+        },
+        {
+          "at": "2026-11-03T09:55:25.933Z",
+          "actor": "merchant",
+          "method": "GET",
+          "url": "/api/demo/buggy/probe",
+          "status": 200,
+          "ms": 905,
+          "note": "has the refund reached the merchant?"
+        },
+        {
+          "at": "2026-11-03T09:55:42.017Z",
+          "actor": "merchant",
+          "method": "GET",
+          "url": "/api/demo/buggy/probe",
+          "status": 200,
+          "ms": 910,
+          "note": "has the refund reached the merchant?"
+        },
+        {
+          "at": "2026-11-03T09:55:58.950Z",
+          "actor": "merchant",
+          "method": "GET",
+          "url": "/api/demo/buggy/probe",
+          "status": 200,
+          "ms": 1717,
+          "note": "has the refund reached the merchant?"
+        }
+      ],
+      "durationMs": 139022,
+      "activeMs": 17683
+    }
+  ],
+  "explanations": [],
+  "recordedAt": "2026-11-03T09:55:58.962Z",
+  "wallMs": 144955
+}
