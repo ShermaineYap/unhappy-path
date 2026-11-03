@@ -198,10 +198,10 @@ export async function explain(r: ScenarioResult, creds: Creds, stack = "Next.js 
       maxRetries: 0,
       schema: z.object({
         headline: z.string().describe("Max 14 words, plain English."),
-        rootCause: z.string().describe("2-3 sentences: the specific mistake in the merchant's code, grounded in the facts."),
+        rootCause: z.string().describe("2-3 sentences: the most likely mistake in the merchant's code, grounded only in the observed behaviour; say 'likely' when inferring code you cannot see."),
         impact: z.string().describe("1-2 sentences: what this costs a real shop."),
         fixLanguage: z.string(),
-        fixCode: z.string().describe(`A minimal, correct fix for a ${stack} server. Max 18 lines. No placeholders like '...'.`),
+        fixCode: z.string().describe(`A minimal, correct, production-safe fix for a ${stack} server, formatted on multiple lines. Max 18 lines. No placeholders like '...'. Idempotency must use durable storage (a database unique key), never an in-memory Set.`),
         citations: z.array(z.enum(DOCS.map((d) => d.id) as [string, ...string[]])).min(1).max(3),
       }),
       system: "You write precise, honest fix notes for developers integrating PayPal. Never claim facts not present in the input. Cite only from the provided doc ids.",
